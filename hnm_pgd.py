@@ -144,6 +144,206 @@ def conntet_test(input_img):
         return False,label_max_number,total_area_rate,total_area
 
 
+def pad_flip(img_608, img_800,ptb):
+    frcnn_img_0 = normalize(unnormalize(img_800)+uprcnn(ptb))
+    yolo_img_0 = img_608 + upyolo(ptb)
+
+    # yolo_re_size = np.random.choice(a=range(400,600,2),
+    #                                 size=1, replace=False, p=None).item()
+    yolo_re_size = 500
+    yolo_pad_size = (608 - yolo_re_size) //2
+    yolo_pad = torch.nn.ConstantPad2d(padding=yolo_pad_size, value=0.)
+    yolo_img_1 = F.pad(F.interpolate(yolo_img_0, size=yolo_re_size, mode="bilinear", align_corners=False),
+                        pad=tuple([yolo_pad_size]*4), mode='constant', value=0)
+
+    # frcnn_re_size = np.random.choice(a=range(600,800,2),
+    #                                 size=1, replace=False, p=None).item()
+
+    frcnn_re_size = 500
+    frcnn_pad_size = (800 - frcnn_re_size) // 2
+    frcnn_pad = torch.nn.ConstantPad2d(padding=frcnn_pad_size, value=0.)
+    frcnn_img_1 = F.pad(F.interpolate(frcnn_img_0, size=frcnn_re_size, mode="bilinear", align_corners=False),
+                        pad=tuple([frcnn_pad_size]*4), mode='constant', value=0)
+
+    # return yolo_img_1, frcnn_img_1
+    # return yolo_img_1.mul(yolo_hflip), frcnn_img_1.mul(frcnn_hflip)
+    return yolo_img_0.mul(yolo_hflip), frcnn_img_0.mul(frcnn_hflip)
+
+
+def attack(epsilon, pixel_percent, mask_type, num_images):
+    masks_path = 'masks'
+
+    if not os.path.exists(masks_path):
+        os.makedirs(masks_path)
+
+    for img_name_index in range(num_images):# len(files)
+
+
+        img_name = files[img_name_index]
+
+
+
+        print()
+        print(img_name_index,img_name)
+
+
+        img_path0 = os.path.join('select1000_new', img_name)
+        img_path1 = os.path.join('select1000_new_p', mask_type + "_" +  str(int(epsilon*255)) + "_" + str(int(pixel_percent*100)) + "%_" + img_name)
+
+        img0 = Image.open(img_path0).convert('RGB')
+        img0_608 = resize_small(img0)
+        boxes0_all = do_detect(darknet_model, img0_608, 0.5, 0.4, True)
+
+        num_box = len(boxes0_all)
+        print('Yolo detect:',num_box)
+
+        result_p = inference_detector(mmdmodel,img_path0)
+
+        result_above_confidence_num_ori = parse_mmd(result_p)
+        print('RCNN detect:',result_above_confidence_num_ori)
+
+        mmd_imgs,_ = inference_detector2(detector,img_path0)
+
+
+        ori_imgs_t = resize2(Image.open('select1000_new/'+img_name).convert('RGB')).unsqueeze(0).cuda()
+
+        img_mask_path = os.path.join(masks_path, mask_type + "_" +  str(int(epsilon*255)) + "_" + str(int(pixel_percent*100)) + "%" + img_name)
+
+        # mask = read_mask(img_mask_path).to(device)
+
+        num_std = 2.1
+        flag = 0
+        while not flag:
+            num_std += 0.1
+            mask,flag = get_mask_all_small(pixel_percent*500*500, ori_imgs_t, mmd_imgs, model=darknet_model,detector =detector,img_metas =img_metas,num_std=num_std, mask_type=mask_type)
+        mask = mask.to(device)
+
+        save_image(mask,os.path.join(masks_path, mask_type + "_" +  str(int(epsilon*255)) + "_" + str(int(pixel_percent*100)) + "%_" + img_name))
+
+
+        img0 = Image.open(img_path0).convert('RGB')
+        img0_608 = resize_small(img0)
+
+        width = img0_608.width
+        height = img0_608.height
+        img0 = torch.ByteTensor(torch.ByteStorage.from_buffer(img0_608.tobytes()))
+        img0 = img0.view(height, width, 3).transpose(0, 1).transpose(0, 2).contiguous()
+        img0 = img0.view(1, 3, height, width)
+        img0 = img0.float().div(255.0)
+        img0 = img0.to(device)
+
+
+        delta = torch.FloatTensor(1, 3, 500, 500).cuda()
+        torch.nn.init.normal_(delta, mean=0, std=1.)
+        delta.data = clamp(delta, torch.maximum(0. - ori_imgs_t, torch.full(ori_imgs_t.size(), -epsilon).to(device)).to(device), torch.minimum(1. - ori_imgs_t, torch.full(ori_imgs_t.size(), epsilon).to(device)).to(device)).mul_(mask)
+        #delta.data = clamp(delta, 0. - ori_imgs_t, 1. - ori_imgs_t).mul_(mask)
+
+        delta.requires_grad = True
+
+        bestloss = 200000
+        bestdalta = delta.data
+
+
+        for p in range(800):
+
+            if p % 100 == 0:
+                print("pgd iteration: ", p)
+
+            # yolo_input, frcnn_input = pad_flip(img0, mmd_imgs,delta)
+
+            list_boxes = darknet_model(img0+upyolo(delta))
+            obj_confs_list = []
+            for idx, box in enumerate(list_boxes):
+                obj_confs_list.append(torch.cat((box[0][4].view(-1),box[0][4+85].view(-1),box[0][4+170].view(-1)),0))
+            obj_confs_yolo = torch.cat([obj_confs_list[i] for i in range(len(obj_confs_list))],0)
+
+            obj_conf_thresh_rcnn = 0.3
+            obj_conf_thresh = 0.5
+
+            obj_confs_yolo = sigm(obj_confs_yolo)
+
+            result_above_confidence_num_yolo = len(obj_confs_yolo[obj_confs_yolo >0.45])
+            
+
+            obj_confs_yolo = obj_confs_yolo[obj_confs_yolo > obj_conf_thresh]
+
+            obj_loss = 0
+
+            frcnn_input = normalize(unnormalize(mmd_imgs)+uprcnn(delta))
+            
+            obj_confs_rcnn,bk_scores = getmm_list2(detector,frcnn_input,img_metas)
+
+            result_above_confidence_num_rcnn = len(obj_confs_rcnn[obj_confs_rcnn >0.25])
+
+            obj_confs_rcnn = obj_confs_rcnn[obj_confs_rcnn > 0.1]
+
+            if result_above_confidence_num_rcnn==0:
+                obj_confs_rcnn = []
+            
+            if result_above_confidence_num_yolo==0:
+                obj_confs_yolo = []
+
+            if (result_above_confidence_num_rcnn+result_above_confidence_num_yolo)<=bestloss:
+                bestloss = result_above_confidence_num_rcnn+result_above_confidence_num_yolo
+                bestdalta = delta.data
+
+            if (len(obj_confs_yolo)!=0) or (len(bk_scores)!=0) :
+
+                if len(obj_confs_yolo):
+                    targets_yolo = torch.ones_like(obj_confs_yolo).to(device)
+                    obj_loss += loss(obj_confs_yolo,targets_yolo)
+
+                if len(bk_scores):
+                    targets_bk = torch.LongTensor([80 for i in range(len(bk_scores))]).to(device)
+                    obj_loss -=lossce(bk_scores,targets_bk)
+
+                obj_loss.backward()
+                grad = delta.grad.detach()
+                d = alpha*torch.sign(grad)
+                # delta.data = clamp(delta+d, 0. - ori_imgs_t, 1. - ori_imgs_t).mul_(mask)
+                delta.data = clamp(delta+d, torch.maximum(0. - ori_imgs_t, torch.full(ori_imgs_t.size(), -epsilon).to(device)).to(device), torch.minimum(1. - ori_imgs_t, torch.full(ori_imgs_t.size(), epsilon).to(device)).to(device)).mul_(mask)
+                delta.grad.zero_()
+
+            else:
+                with open("hnm_pgd.txt", "a") as output:
+                    output.write(str(img_name_index)+'-hnm_pgd: '+str(img_name)+' pgd break! in round '+str(p)+'\n')
+                break
+
+        save_image(ori_imgs_t+bestdalta,img_path1)
+
+        img_new_608 = resize_small(Image.open(img_path1).convert('RGB'))
+
+        boxes0 = do_detect(darknet_model, img_new_608, 0.5, 0.4, True)
+        
+        result_p = inference_detector(mmdmodel,img_path1)
+
+        result_above_confidence_num_p = parse_mmd(result_p)
+
+        print('hnm_pgd:',img_name,'done!, Yolo detect left',len(boxes0),', RCNN detect left',result_above_confidence_num_p)
+
+
+        img0 = Image.open('select1000_new/'+img_name).convert('RGB')
+        img1 = Image.open(img_path1).convert('RGB')
+        img0_t = resize2(img0).cuda()
+        img1_t = resize2(img1).cuda()
+        img_minus_t = img0_t - img1_t
+
+        unsatified,num_patch,total_area_rate,total_area = conntet_test(img_minus_t)
+        print(unsatified,num_patch,total_area_rate,total_area)
+        if unsatified:
+            print(img_name, 'fail! >10 patch:',num_patch,'area:', total_area_rate)
+            if img_name not in fail_image:
+                fail_image.append(img_name)
+
+        with open("hnm_pgd.txt", "a") as output:
+            output.write(str(img_name_index)+'-fail_image: '+str(img_name)+', num_patch: '+str(num_patch)+'-'+str(total_area)+'!, Yolo left '+str(len(boxes0))+', RCNN left '+str(result_above_confidence_num_p)+'\n')
+
+    print(fail_image)
+
+    return len(boxes0), result_above_confidence_num_p
+
+
+#-----------------------------------------------------------------------------------------------------------------------------------------
 
 
 config = '../mmdetection/configs/faster_rcnn/faster_rcnn_r50_fpn_1x_coco.py'
@@ -224,10 +424,11 @@ normalize = lambda x: (x-mu)/std
 sigm = nn.Sigmoid()
 # loss = nn.SmoothL1Loss(reduction='sum')
 loss = nn.BCELoss(reduction = 'sum')
+
 lossce = nn.NLLLoss(reduction='sum')
 count = 0
 
-alpha= 4/255
+alpha= 4/255 #original
 
 uprcnn = torch.nn.Upsample(size=800, mode='bilinear')
 
@@ -236,197 +437,30 @@ upyolo = torch.nn.Upsample(size=608, mode='bilinear')
 frcnn_hflip = torch.eye(800).flip(0).to(device)
 yolo_hflip = torch.eye(608).flip(0).to(device)
 
-
-def pad_flip(img_608, img_800,ptb):
-    frcnn_img_0 = normalize(unnormalize(img_800)+uprcnn(ptb))
-    yolo_img_0 = img_608 + upyolo(ptb)
-
-    # yolo_re_size = np.random.choice(a=range(400,600,2),
-    #                                 size=1, replace=False, p=None).item()
-    yolo_re_size = 500
-    yolo_pad_size = (608 - yolo_re_size) //2
-    yolo_pad = torch.nn.ConstantPad2d(padding=yolo_pad_size, value=0.)
-    yolo_img_1 = F.pad(F.interpolate(yolo_img_0, size=yolo_re_size, mode="bilinear", align_corners=False),
-                        pad=tuple([yolo_pad_size]*4), mode='constant', value=0)
-
-    # frcnn_re_size = np.random.choice(a=range(600,800,2),
-    #                                 size=1, replace=False, p=None).item()
-
-    frcnn_re_size = 500
-    frcnn_pad_size = (800 - frcnn_re_size) // 2
-    frcnn_pad = torch.nn.ConstantPad2d(padding=frcnn_pad_size, value=0.)
-    frcnn_img_1 = F.pad(F.interpolate(frcnn_img_0, size=frcnn_re_size, mode="bilinear", align_corners=False),
-                        pad=tuple([frcnn_pad_size]*4), mode='constant', value=0)
-
-    # return yolo_img_1, frcnn_img_1
-    # return yolo_img_1.mul(yolo_hflip), frcnn_img_1.mul(frcnn_hflip)
-    return yolo_img_0.mul(yolo_hflip), frcnn_img_0.mul(frcnn_hflip)
-
-
-masks_path = 'masks'
-
-if not os.path.exists(masks_path):
-    os.makedirs(masks_path)
-
-for img_name_index in range(len(files)):
-
-
-    img_name = files[img_name_index]
-
-
-
-    print()
-    print(img_name_index,img_name)
-
-
-    img_path0 = os.path.join('select1000_new', img_name)
-    img_path1 = os.path.join('select1000_new_p', img_name)
-
-    img0 = Image.open(img_path0).convert('RGB')
-    img0_608 = resize_small(img0)
-    boxes0_all = do_detect(darknet_model, img0_608, 0.5, 0.4, True)
-
-    num_box = len(boxes0_all)
-    print('Yolo detect:',num_box)
-
-    result_p = inference_detector(mmdmodel,img_path0)
-
-    result_above_confidence_num_ori = parse_mmd(result_p)
-    print('RCNN detect:',result_above_confidence_num_ori)
-
-    mmd_imgs,_ = inference_detector2(detector,img_path0)
-
-
-    ori_imgs_t = resize2(Image.open('select1000_new/'+img_name).convert('RGB')).unsqueeze(0).cuda()
-
-    img_mask_path = os.path.join(masks_path, img_name)
-
-    # mask = read_mask(img_mask_path).to(device)
-
-    num_std = 2.1
-    flag = 0
-    while not flag:
-        num_std += 0.1
-        mask,flag = get_mask_all_small(5000, ori_imgs_t, mmd_imgs, model=darknet_model,detector =detector,img_metas =img_metas,num_std=num_std)
-    mask = mask.to(device)
-
-    save_image(mask,os.path.join(masks_path, img_name))
-
-
-    img0 = Image.open(img_path0).convert('RGB')
-    img0_608 = resize_small(img0)
-
-    width = img0_608.width
-    height = img0_608.height
-    img0 = torch.ByteTensor(torch.ByteStorage.from_buffer(img0_608.tobytes()))
-    img0 = img0.view(height, width, 3).transpose(0, 1).transpose(0, 2).contiguous()
-    img0 = img0.view(1, 3, height, width)
-    img0 = img0.float().div(255.0)
-    img0 = img0.to(device)
-
-
-    delta = torch.FloatTensor(1, 3, 500, 500).cuda()
-    torch.nn.init.normal_(delta, mean=0, std=1.)
-    delta.data = clamp(delta, 0. - ori_imgs_t, 1. - ori_imgs_t).mul_(mask)
-
-    delta.requires_grad = True
-
-    bestloss = 200000
-    bestdalta = delta.data
-
-
-    for p in range(800):
-
-        # yolo_input, frcnn_input = pad_flip(img0, mmd_imgs,delta)
-
-        list_boxes = darknet_model(img0+upyolo(delta))
-        obj_confs_list = []
-        for idx, box in enumerate(list_boxes):
-            obj_confs_list.append(torch.cat((box[0][4].view(-1),box[0][4+85].view(-1),box[0][4+170].view(-1)),0))
-        obj_confs_yolo = torch.cat([obj_confs_list[i] for i in range(len(obj_confs_list))],0)
-
-        obj_conf_thresh_rcnn = 0.3
-        obj_conf_thresh = 0.5
-
-        obj_confs_yolo = sigm(obj_confs_yolo)
-
-        result_above_confidence_num_yolo = len(obj_confs_yolo[obj_confs_yolo >0.45])
-        
-
-        obj_confs_yolo = obj_confs_yolo[obj_confs_yolo > obj_conf_thresh]
-
-        obj_loss = 0
-
-        frcnn_input = normalize(unnormalize(mmd_imgs)+uprcnn(delta))
-        
-        obj_confs_rcnn,bk_scores = getmm_list2(detector,frcnn_input,img_metas)
-
-        result_above_confidence_num_rcnn = len(obj_confs_rcnn[obj_confs_rcnn >0.25])
-
-        obj_confs_rcnn = obj_confs_rcnn[obj_confs_rcnn > 0.1]
-
-        if result_above_confidence_num_rcnn==0:
-            obj_confs_rcnn = []
-        
-        if result_above_confidence_num_yolo==0:
-            obj_confs_yolo = []
-
-        if (result_above_confidence_num_rcnn+result_above_confidence_num_yolo)<=bestloss:
-            bestloss = result_above_confidence_num_rcnn+result_above_confidence_num_yolo
-            bestdalta = delta.data
-
-        if (len(obj_confs_yolo)!=0) or (len(bk_scores)!=0) :
-
-            if len(obj_confs_yolo):
-                targets_yolo = torch.ones_like(obj_confs_yolo).to(device)
-                obj_loss += loss(obj_confs_yolo,targets_yolo)
-
-            if len(bk_scores):
-                targets_bk = torch.LongTensor([80 for i in range(len(bk_scores))]).to(device)
-                obj_loss -=lossce(bk_scores,targets_bk)
-
-            obj_loss.backward()
-            grad = delta.grad.detach()
-            d = alpha*torch.sign(grad)
-            delta.data = clamp(delta+d, 0. - ori_imgs_t, 1. - ori_imgs_t).mul_(mask)
-            delta.grad.zero_()
-
-        else:
-            with open("hnm_pgd.txt", "a") as output:
-                output.write(str(img_name_index)+'-hnm_pgd: '+str(img_name)+' pgd break! in round '+str(p)+'\n')
-            break
-
-    save_image(ori_imgs_t+bestdalta,img_path1)
-
-    img_new_608 = resize_small(Image.open(img_path1).convert('RGB'))
-
-    boxes0 = do_detect(darknet_model, img_new_608, 0.5, 0.4, True)
-    
-    result_p = inference_detector(mmdmodel,img_path1)
-
-    result_above_confidence_num_p = parse_mmd(result_p)
-
-    print('hnm_pgd:',img_name,'done!, Yolo detect left',len(boxes0),', RCNN detect left',result_above_confidence_num_p)
-
-
-    img0 = Image.open('select1000_new/'+img_name).convert('RGB')
-    img1 = Image.open(img_path1).convert('RGB')
-    img0_t = resize2(img0).cuda()
-    img1_t = resize2(img1).cuda()
-    img_minus_t = img0_t - img1_t
-
-    unsatified,num_patch,total_area_rate,total_area = conntet_test(img_minus_t)
-    print(unsatified,num_patch,total_area_rate,total_area)
-    if unsatified:
-        print(img_name, 'fail! >10 patch:',num_patch,'area:', total_area_rate)
-        if img_name not in fail_image:
-            fail_image.append(img_name)
-
-    with open("hnm_pgd.txt", "a") as output:
-        output.write(str(img_name_index)+'-fail_image: '+str(img_name)+', num_patch: '+str(num_patch)+'-'+str(total_area)+'!, Yolo left '+str(len(boxes0))+', RCNN left '+str(result_above_confidence_num_p)+'\n')
-
-print(fail_image)
-
+# epsilon_list = [2/255, 4/255, 8/255, 16/255, 32/255, 64/255]
+# pixel_percent_list = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32]
+epsilon_list = [8/255]
+pixel_percent_list = [0.04]
+
+# epsilon = 8/255
+# pixel_percent = 0.02
+mask_type = "greedy"
+num_images = 1
+
+Yolo_results = []
+RCNN_results = []
+
+for epsilon in epsilon_list:
+    for pixel_percent in pixel_percent_list:
+        print("setting: ", "epsilon=", epsilon, " pixel_percent=", pixel_percent)
+        Yolo_detect_left, RCNN_detect_left = attack(epsilon, pixel_percent, mask_type, num_images=num_images)
+        Yolo_results.append(Yolo_detect_left)
+        RCNN_results.append(RCNN_detect_left)
+
+print("Yolo_results: ", Yolo_results)
+print("RCNN_results: ", RCNN_results)
+
+# Yolo_detect_left, RCNN_detect_left = attack(epsilon, pixel_percent, mask_type, num_images=num_images)
 
 
 

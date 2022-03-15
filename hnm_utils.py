@@ -15,6 +15,9 @@ from skimage import measure
 
 from utils.utils import *
 import matplotlib.pyplot as plt
+from mask_heuristic import generate_greedy_mask
+from mask_heuristic import generate_random_mask
+from mask_heuristic import generate_beam_mask
 
 device='cuda:0'
 
@@ -95,6 +98,7 @@ def knn_filter(x, size=5, k=13):
     return x
 
 def knn_process_small(x, k1 = 13, k2 = 3, pixel_thresh=1000, patch_thresh=10):
+    print("generate mask")
     knn_mask = x.cpu().detach()
     success = 0
     while k1 > k2:
@@ -110,12 +114,14 @@ def knn_process_small(x, k1 = 13, k2 = 3, pixel_thresh=1000, patch_thresh=10):
             success = 1
             break
         k1-=4
-    # plt.imshow(knn_mask.cpu().detach().numpy())
-    # plt.savefig('./knn_mask.jpg')
+    #plt.imshow(knn_mask.cpu().detach().numpy())
+    plt.savefig('./knn_mask_hn.jpg')
+
+    #plt.savefig('./knn_mask_random.jpg')
+
     return knn_mask,success
 
-
-def get_mask_all_small(num_patch,img_500, img_mmd_800, model,detector, img_metas, num_std, step=100):
+def get_mask_all_small(num_pixel,img_500, img_mmd_800, model,detector, img_metas, num_std, step=100, mask_type="random"):
     ## using bce loss and l1 loss
     sigm = nn.Sigmoid()
     bceloss = nn.BCELoss(reduction='mean')
@@ -177,10 +183,30 @@ def get_mask_all_small(num_patch,img_500, img_mmd_800, model,detector, img_metas
         mix_grad += grad
         delta.grad.zero_()
 
+    flag = True
+    if mask_type == "random":
+        pgd_mask = generate_random_mask(500, 500, pixel_thresh=num_pixel)
+    elif mask_type == "greedy":
+        sensitivity_matrix = ((torch.sum(torch.abs(mix_grad), axis=1)).squeeze_())
+        pgd_mask = generate_greedy_mask(sensitivity_matrix, pixel_thresh=num_pixel)
+    elif mask_type == "hn":
+        sensitivity_matrix = ((torch.sum(torch.abs(mix_grad), axis=1)).squeeze_())
+        heat_map,_,_ = count_patch(sensitivity_matrix, thresh=torch.mean(sensitivity_matrix)+num_std*torch.std(sensitivity_matrix))
+        pgd_mask, flag = knn_process_small(heat_map,pixel_thresh=num_pixel)
+    elif mask_type == "beam":
+        sensitivity_matrix = ((torch.sum(torch.abs(mix_grad), axis=1)).squeeze_())
+        pgd_mask = generate_beam_mask(sensitivity_matrix, pixel_thresh=num_pixel)
+    else:
+        print("invalid mask type")
 
-    sensitivity_matrix = ((torch.sum(torch.abs(mix_grad), axis=1)).squeeze_())
-    # print(sensitivity_matrix.shape)
-    heat_map,_,_ = count_patch(sensitivity_matrix, thresh=torch.mean(sensitivity_matrix)+num_std*torch.std(sensitivity_matrix))
-    pgd_mask, flag = knn_process_small(heat_map,pixel_thresh=num_patch)
-    return pgd_mask,flag
+    return pgd_mask, flag
+
+    #pgd_mask, flag = generate_full_mask()
+
+    #pgd_mask, flag = knn_process_small(heat_map,pixel_thresh=num_pixel)
+    #return pgd_mask,flag
+
+    
+
+
 
